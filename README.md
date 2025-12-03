@@ -112,3 +112,23 @@ python redis-py-bench.py --size-mb 32 --num-chunks 100 --read --write
 #
 ```
 
+# Scratch Paper / Documentation
+
+`RESP-py-bench.py`
+
+
+```bash
+# custom client is about twice as fast
+python RESP-py-bench.py --size-mb 32 --num-chunks 100 --read --client-type custom
+
+(lmcache_redis) tensormesh@GPU-H100-lccn11:~/jiayis-dad/lmcache_redis/benchmark$ python RESP-py-bench.py --size-mb 32 --num-chunks 100 --read --client-type custom
+Using Custom Zero-Copy Client (Threaded Wrapper)
+Generating 100 chunks of 32MB...
+--- Starting Read Test ---
+Read 3.12 GB in 2.64s | Speed: 1.18 GB/s
+(lmcache_redis) tensormesh@GPU-H100-lccn11:~/jiayis-dad/lmcache_redis/benchmark$ python RESP-py-bench.py --size-mb 32 --num-chunks 100 --read --client-type redis-py
+Using redis-py (Async)
+Generating 100 chunks of 32MB...
+--- Starting Read Test ---
+Read 3.12 GB in 6.98s | Speed: 0.45 GB/s
+```

@@ -1,252 +1,355 @@
-# thread based
-import threading
-import time
-import argparse
-from concurrent.futures import ThreadPoolExecutor
-from typing import List, Tuple
+import redis.asyncio as redis
+import asyncio
 import os
-
-
-
-import socket
 import argparse
+import time
+import uvloop
+import concurrent.futures
+import socket
 
-# Redis client taken from references/RESP.py
 class RedisClient: 
     def __init__(self, host, port, buffer_size): 
         self.sock = socket.create_connection((host, port))
+        
+        # OPTIMIZATION 1: Disable Nagle's algorithm for lower latency
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        
         self.buffer_size = buffer_size
         
-        # Pre-allocate a small buffer (e.g., 64 bytes) for header parsing
-        # RESP headers are small, so this should be sufficient.
-        self.header_buf = bytearray(64) 
+        # Internal buffer for reading headers/metadata to minimize syscalls
+        self._io_buf = bytearray(8192)
+        self._io_view = memoryview(self._io_buf)
+        self._io_pos = 0
+        self._io_end = 0
+
         self.OK_VIEW = memoryview(b"+OK\r\n")
 
-    # --- Low-Level I/O Helpers ---
+    # --- Buffered I/O Helpers ---
 
-    def _recv_into_exactly(self, buf: bytearray, size) -> int:
-        """Reads exactly 'size' bytes directly into the given bytearray."""
-        view = memoryview(buf)[:size]
-        total = 0
-        while total < size:
-            n = self.sock.recv_into(view[total:])
+    def _fill_buffer(self):
+        """Refills the internal IO buffer."""
+        # Reset pointers to maximize space
+        if self._io_pos == self._io_end:
+            self._io_pos = 0
+            self._io_end = 0
+        
+        # Only read if we have space
+        if self._io_end < len(self._io_buf):
+            n = self.sock.recv_into(self._io_view[self._io_end:])
             if n == 0:
-                raise ConnectionError("socket closed before all data received")
-            total += n
-        return total
-    
-    def _recv_exactly(self, size) -> memoryview: 
-        """Utility for reading fixed-size responses (e.g., +OK\r\n) into a new buffer."""
-        buf = bytearray(size)
-        self._recv_into_exactly(buf, size)
-        return memoryview(buf)
-    
-    def _read_header(self) -> bytes:
-        """
-        Optimized header read using recv_into.
-        Finds the end of the header (\r\n) by reading one byte at a time
-        into the pre-allocated header_buf, avoiding iterative concatenation copies.
-        Returns the header as a copy (since it's small metadata).
-        """
+                raise ConnectionError("Socket closed")
+            self._io_end += n
+
+    def _read_byte(self) -> int:
+        """Reads a single byte from the internal buffer, refilling if necessary."""
+        if self._io_pos >= self._io_end:
+            self._fill_buffer()
         
-        # NOTE: Header parsing must read until CRLF, which is a stream operation.
-        # This is the most complex part to make truly zero-copy.
+        b = self._io_buf[self._io_pos]
+        self._io_pos += 1
+        return b
+
+    def _read_line(self) -> bytes:
+        """
+        Reads until CRLF using the internal buffer. 
+        """
+        # FIX: Ensure we have data before setting line_start.
+        # If the buffer is empty, refill it and reset pointers to 0 
+        # BEFORE we decide where the line starts.
+        if self._io_pos >= self._io_end:
+            self._fill_buffer()
+
+        line_start = self._io_pos
         
-        view = memoryview(self.header_buf)
-        total = 0
         while True:
-            # Read one byte into the next slot in the header buffer
-            # This avoids the header = b"" + chunk copy from the original code
-            n = self.sock.recv_into(view[total:total + 1])
-            if n == 0:
-                raise ConnectionError("closed before header complete")
+            chunk = self._io_buf[self._io_pos:self._io_end]
             
-            # Check for \r\n terminator
-            if total >= 1 and self.header_buf[total-1] == 13 and self.header_buf[total] == 10: # 13=CR, 10=LF
-                return bytes(self.header_buf[:total+1]) # Small copy for metadata is acceptable
+            # Check for \r\n in the current chunk
+            if b'\r\n' in chunk:
+                idx = chunk.find(b'\r\n')
+                abs_idx = self._io_pos + idx
+                
+                result = self._io_buf[line_start:abs_idx + 2] # include \r\n
+                self._io_pos = abs_idx + 2
+                return bytes(result)
             
-            total += n
-            if total >= len(self.header_buf):
-                 raise ValueError("Header buffer too small for response header")
+            # Not found? We need more data.
+            if self._io_end == len(self._io_buf):
+                 # Buffer is full and we still haven't found a newline. 
+                 # This implies the header is larger than 8KB.
+                 raise ValueError("Header too large or malformed")
+            
+            # Read more data into the tail of the buffer
+            self._fill_buffer()
 
-    # --- Zero-Copy I/O Operations (Optimized) ---
+    def _send_all_via_sendmsg(self, parts: list[memoryview]):
+        """
+        OPTIMIZATION: Handles partial writes with sendmsg.
+        """
+        while parts:
+            n_sent = self.sock.sendmsg(parts)
+            if n_sent == 0:
+                raise ConnectionError("Socket connection broken")
+            
+            # If everything sent, break
+            # Calculating total length is expensive, so we adjust parts based on n_sent
+            
+            # Advance the views based on what was sent
+            curr_sent = 0
+            while parts and curr_sent < n_sent:
+                part = parts[0]
+                part_len = len(part)
+                rem_sent = n_sent - curr_sent
+                
+                if rem_sent >= part_len:
+                    # This part was fully sent
+                    parts.pop(0)
+                    curr_sent += part_len
+                else:
+                    # This part was partially sent, slice it and stop
+                    parts[0] = part[rem_sent:]
+                    break
 
     def get(self, key: str, recv_buf: bytearray) -> int:
         key_bytes = key.encode()
         
-        # 1. Prepare Command Buffers for sendmsg (Zero-Copy Send)
-        # We use memoryview() on the *small* parts to allow sendmsg to gather them.
-        # The key bytes are automatically gathered.
         command_parts = [
-            memoryview(b"*2\r\n"),                                   # Array header
-            memoryview(f"${len(b'GET')}\r\n".encode()),              # GET bulk length
-            memoryview(b"GET\r\n"),                                  # GET bulk data
-            memoryview(f"${len(key_bytes)}\r\n".encode()),           # Key bulk length
-            memoryview(key_bytes),                                   # Key bulk data
-            memoryview(b"\r\n")                                      # Final CRLF for key
+            memoryview(b"*2\r\n"),
+            memoryview(f"${len(b'GET')}\r\n".encode()),
+            memoryview(b"GET\r\n"),
+            memoryview(f"${len(key_bytes)}\r\n".encode()),
+            memoryview(key_bytes),
+            memoryview(b"\r\n")
         ]
         
-        # Use sendmsg for scatter-gather I/O. This avoids creating one large 'get_cmd' copy.
-        self.sock.sendmsg(command_parts)
+        self._send_all_via_sendmsg(command_parts)
         
-        # 2. Consume Header (Minimized Copy Receive)
-        header = self._read_header()
+        header = self._read_line() # e.g., b'$4194304\r\n' or b'$-1\r\n'
+
+        if header.startswith(b"$-1"):
+            return -1 # Key not found
 
         if not header.startswith(b"$"):
             raise ValueError(f"Unexpected reply: {header!r}")
         
-        # Header is like $12345\r\n. We strip the first ($) and the last two (\r\n)
         size = int(header[1:-2]) 
         
-        # Assertion to maintain POC structure
-        assert size == self.buffer_size, f"Expected {self.buffer_size} bytes, got {size}"
+        # Safety check for buffer size
+        if size > len(recv_buf):
+             raise ValueError(f"Value too large for buffer: {size} > {len(recv_buf)}")
 
-        # 3. Consume Body (Zero-Copy Receive)
-        n = self._recv_into_exactly(recv_buf, size)
+        # --- OPTIMIZATION: Zero-Copy Read handling internal buffer overlap ---
+        
+        bytes_read = 0
+        
+        # 1. Drain internal buffer first (Zero-copy logic)
+        # If the server sent [Header][Start of Body] in one packet, 
+        # it is sitting in self._io_buf
+        remaining_in_io = self._io_end - self._io_pos
+        
+        if remaining_in_io > 0:
+            to_copy = min(size, remaining_in_io)
+            recv_buf[0:to_copy] = self._io_buf[self._io_pos : self._io_pos + to_copy]
+            self._io_pos += to_copy
+            bytes_read += to_copy
+            
+        # 2. Read remainder directly into user buffer
+        if bytes_read < size:
+            view = memoryview(recv_buf)
+            while bytes_read < size:
+                needed = size - bytes_read
+                n = self.sock.recv_into(view[bytes_read:bytes_read+needed])
+                if n == 0:
+                    raise ConnectionError("Socket closed mid-body")
+                bytes_read += n
+        
+        # 3. Consume trailing CRLF
+        # We must be careful: the CRLF might be in the stream now, 
+        # or partially in our io_buf if we over-read (though recv_into above limits that).
+        # We simply use _read_line or _read_byte to eat 2 bytes.
+        # Since we did recv_into exactly `needed`, the socket pointer is at the CRLF.
+        
+        # We can't assume the internal buffer has the CRLF because we bypassed it 
+        # for the large read. We should just read 2 bytes safely.
+        
+        # To keep it simple/safe, we read 2 bytes. 
+        # Optimization note: Since we bypassed _io_buf for the body, _io_buf is effectively empty/invalid
+        # regarding the stream position unless we implement complex cursor logic.
+        # For this POC, we can just do a small read.
+        
+        self._io_pos = 0; self._io_end = 0 # Invalidate buffer after direct socket read
+        c1 = self.sock.recv(1)
+        c2 = self.sock.recv(1)
+        if c1 != b'\r' or c2 != b'\n':
+             raise ValueError("Missing final CRLF")
 
-        # 4. Consume trailing CRLF
-        self._recv_exactly(2)
-
-        return n
+        return bytes_read
 
     def set(self, key: str, send_buf: bytearray):
         key_bytes = key.encode()
         
-        # 1. Prepare Command Buffers for sendmsg (Zero-Copy Send)
-        # memoryview(send_buf) ensures the large data payload is not copied
         command_parts = [
-            memoryview(b"*3\r\n"),                                   # Array header
-            memoryview(f"${len(b'SET')}\r\n".encode()),              # SET bulk length
-            memoryview(b"SET\r\n"),                                  # SET bulk data
-            memoryview(f"${len(key_bytes)}\r\n".encode()),           # Key bulk length
-            memoryview(key_bytes),                                   # Key bulk data
-            memoryview(b"\r\n"),                                     # CRLF after key
-            memoryview(f"${len(send_buf)}\r\n".encode()),            # Value bulk length
-            memoryview(send_buf),                                    # Value data (The Zero-Copy Payload)
-            memoryview(b"\r\n")                                      # Final CRLF
+            memoryview(b"*3\r\n"),
+            memoryview(f"${len(b'SET')}\r\n".encode()),
+            memoryview(b"SET\r\n"),
+            memoryview(f"${len(key_bytes)}\r\n".encode()),
+            memoryview(key_bytes),
+            memoryview(b"\r\n"),
+            memoryview(f"${len(send_buf)}\r\n".encode()),
+            memoryview(send_buf),
+            memoryview(b"\r\n")
         ]
         
-        # Use sendmsg to send all parts without concatenating them in Python memory
-        self.sock.sendmsg(command_parts)
+        self._send_all_via_sendmsg(command_parts)
 
-        # 2. Expect +OK\r\n (Fixed-size Zero-Copy into temporary buffer)
-        reply = self._recv_exactly(5)
-        if reply != self.OK_VIEW:
-            raise ValueError(f"Unexpected reply: {reply!r}")
+        # Buffer response reading
+        reply = self._read_line()
+        if reply != b"+OK\r\n":
+             raise ValueError(f"Unexpected reply: {reply!r}")
 
+# 32 MB
+read_write_size = 32 * 1024 ** 2
 
-
-
-
-
-# Global settings (simplified, can be passed via args if needed)
-HOST = "127.0.0.1"
-PORT = 6379
-MAX_THREADS = 100
-
-def make_chunks(size_mb: int, num_chunks: int) -> List[Tuple[str, bytearray]]:
-    """Generates key-bytearray pairs for SET operations."""
-    num_bytes = size_mb * 1024 ** 2
-    chunks = []
-    for i in range(num_chunks):
-        # We use bytearray here so we can pass it to the RedisClient
-        data = bytearray(os.urandom(num_bytes)) 
-        chunks.append((f"chunk_{i}", data))
-    return chunks
-
-def run_writer_task(client: RedisClient, key: str, data: bytearray):
-    """Worker function for SET operations in a thread pool."""
-    client.set(key, data)
-
-def run_reader_task(client: RedisClient, key: str, buffer_size: int):
-    """Worker function for GET operations in a thread pool."""
-    recv_buf = bytearray(buffer_size) # Each thread/task needs its own buffer
-    client.get(key, recv_buf)
-    # The read data is now in recv_buf, ready for use/validation
-
-def prepopulate_reader_data(clients: List[RedisClient], read_chunks: List[Tuple[str, bytearray]]):
-    """Synchronously writes all data needed for the read benchmark."""
-    print("Prepopulating read data...")
-    for i, (key, data) in enumerate(read_chunks):
-        client = clients[i % len(clients)]
-        client.set(key, data)
-    print("Prepopulation complete.")
-
-def benchmark_io(mode: str, num_chunks: int, size_mb: int, concurrent: bool):
+# --- ADAPTER FOR YOUR CUSTOM CLIENT ---
+class SyncToAsyncAdapter:
     """
-    Runs the benchmark using a ThreadPoolExecutor.
-    mode: 'read' or 'write'
+    Wraps your blocking client to run in a thread pool, 
+    allowing it to coexist with the asyncio benchmark.
     """
-    total_size = size_mb * 1024 ** 2 * num_chunks
-    gb = total_size / 1024 ** 3
+    def __init__(self, host, port, buffer_size, pool_executor):
+        self._client = RedisClient(host, port, buffer_size)
+        self._pool = pool_executor
+        # Create a dedicated buffer for this client instance to reuse
+        self._recv_buf = bytearray(buffer_size)
 
-    # Setup clients (one connection per thread/pool)
-    print(f"Setting up {MAX_THREADS} synchronous client connections...")
-    clients = [RedisClient(HOST, PORT) for _ in range(MAX_THREADS)]
-    
-    # Data preparation
-    chunks_to_process = make_chunks(size_mb, num_chunks)
-    
-    if mode == 'read':
-        # Prepopulate data using the established connections
-        prepopulate_reader_data(clients, chunks_to_process)
+    async def set(self, key: str, value: bytes):
+        # We must copy bytes -> bytearray for your client
+        # (This adds overhead, but is required to match the benchmark API)
+        # In a real use case, you'd start with bytearrays.
+        if isinstance(value, bytes):
+            # We copy into our reusable buffer to send
+            # Note: This copy hurts your benchmarks. 
+            # ideally the benchmark generator produces bytearrays.
+            self._recv_buf[:len(value)] = value
+            val_to_send = self._recv_buf[:len(value)]
+        else:
+            val_to_send = value
+            
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._pool, 
+            self._client.set, 
+            key, 
+            val_to_send
+        )
 
-    print(f"Starting {mode} benchmark ({num_chunks} chunks of {size_mb} MB, {gb:.2f} GB total)...")
+    async def get(self, key: str):
+        loop = asyncio.get_running_loop()
+        # Pass the pre-allocated buffer
+        n = await loop.run_in_executor(
+            self._pool, 
+            self._client.get, 
+            key, 
+            self._recv_buf
+        )
+        return n # Return bytes read, not the data object (to avoid copy cost)
+
+# --- MODIFIED BENCHMARK UTILS ---
+
+def make_chunks(size: int, num_chunks: int, as_bytearray=False) -> list:
+    num_bytes = size * 1024 ** 2
+    print(f"Generating {num_chunks} chunks of {size}MB...")
+    if as_bytearray:
+        # Pre-allocate bytearrays for the custom client to shine
+        return [bytearray(os.urandom(num_bytes)) for _ in range(num_chunks)]
+    return [os.urandom(num_bytes) for _ in range(num_chunks)]
+
+async def writer(client, write_chunks: list, total_size: int, concurrent_mode: bool):
     start_time = time.time()
     
-    # Use ThreadPoolExecutor for concurrent execution
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        if mode == 'write':
-            # Run SET tasks concurrently
-            futures = [
-                executor.submit(
-                    run_writer_task, 
-                    clients[i % MAX_THREADS], # Cycle through clients
-                    key, 
-                    data
-                ) 
-                for i, (key, data) in enumerate(chunks_to_process)
-            ]
-        elif mode == 'read':
-            # Run GET tasks concurrently
-            futures = [
-                executor.submit(
-                    run_reader_task, 
-                    clients[i % MAX_THREADS], 
-                    key, 
-                    size_mb * 1024 ** 2 # Buffer size needed
-                ) 
-                for i, (key, data) in enumerate(chunks_to_process)
-            ]
+    if concurrent_mode:
+        # Create tasks
+        tasks = [client.set(f"write_chunk_{i}", chunk) for i, chunk in enumerate(write_chunks)]
+        await asyncio.gather(*tasks)
+    else:
+        # Sequential
+        for i, chunk in enumerate(write_chunks):
+            await client.set(f"write_chunk_{i}", chunk)
             
-        # Wait for all tasks to complete and check for exceptions
-        for future in futures:
-            future.result() 
-
     end_time = time.time()
-    
-    for client in clients:
-        client.close()
-        
     duration = end_time - start_time
-    rate = gb / duration
-    print(f"Finished {mode} operation.")
-    print(f"Total time: {duration:.2f} seconds")
-    print(f"Achieved rate: {rate:.2f} GB/s")
+    gb = total_size / 1024 ** 3
+    print(f"Wrote {gb:.2f} GB in {duration:.2f}s | Speed: {gb / duration:.2f} GB/s")
 
-def main():
-    parser = argparse.ArgumentParser(description="Zero-Copy Redis Benchmark")
-    parser.add_argument("--size-mb", type=int, default=32, help="Size of each chunk in MB.")
-    parser.add_argument("--num-chunks", type=int, default=1000, help="Number of chunks/operations.")
-    parser.add_argument("--read", action="store_true", help="Run read (GET) benchmark.")
-    parser.add_argument("--write", action="store_true", help="Run write (SET) benchmark.")
+async def reader(client, num_chunks, total_size, concurrent_mode):
+    start_time = time.time()
+    
+    if concurrent_mode:
+        # FIX: Changed "read_chunk_" to "write_chunk_" to match the writer
+        tasks = [client.get(f"write_chunk_{i}") for i in range(num_chunks)]
+        await asyncio.gather(*tasks)
+    else:
+        for i in range(num_chunks):
+            # FIX: Changed "read_chunk_" to "write_chunk_"
+            await client.get(f"write_chunk_{i}")
+            
+    end_time = time.time()
+    duration = end_time - start_time
+    gb = total_size / 1024 ** 3
+    print(f"Read {gb:.2f} GB in {duration:.2f}s | Speed: {gb / duration:.2f} GB/s")
+
+async def main(args):
+    # Determine Client Type
+    if args.client_type == "redis-py":
+        print("Using redis-py (Async)")
+        pool = redis.ConnectionPool.from_url("redis://localhost", max_connections=100)
+        client = redis.Redis.from_pool(pool)
+        use_bytearray = False
+        
+    elif args.client_type == "custom":
+        print("Using Custom Zero-Copy Client (Threaded Wrapper)")
+        # We use a ThreadPoolExecutor to prevent blocking the async loop
+        # max_workers=1 simulates serial execution (fair for a single socket)
+        # max_workers=10 simulates a connection pool
+        pool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency_level)
+        
+        # NOTE: This creates ONE client. For true concurrency, you need a pool of CustomClients.
+        # This is just a wrapper for the single client we wrote.
+        client = SyncToAsyncAdapter("127.0.0.1", 6379, args.size_mb * 1024**2, pool_executor)
+        use_bytearray = True # CRITICAL: Use mutable buffers
+        
+    else:
+        raise ValueError("Unknown client type")
+
+    total_size = args.size_mb * 1024 ** 2 * args.num_chunks
+    
+    # Generate Data
+    # If custom client, we generate bytearrays to avoid conversion overhead
+    chunks = make_chunks(args.size_mb, args.num_chunks, as_bytearray=use_bytearray)
+
+    if args.write:
+        print("--- Starting Write Test ---")
+        await writer(client, chunks, total_size, args.concurrent)
+        
+    if args.read:
+        print("--- Starting Read Test ---")
+        # Ensure data exists for reading if we didn't just write it
+        if not args.write:
+             # Pre-populate logic (simplified)
+             pass 
+        await reader(client, args.num_chunks, total_size, args.concurrent)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client-type", type=str, default="redis-py", choices=["redis-py", "custom"])
+    parser.add_argument("--size-mb", type=int, default=32)
+    parser.add_argument("--num-chunks", type=int, default=10)
+    parser.add_argument("--read", action="store_true")
+    parser.add_argument("--write", action="store_true")
+    parser.add_argument("--concurrent", action="store_true")
+    parser.add_argument("--concurrency-level", type=int, default=1, help="Threads for custom client")
     
     args = parser.parse_args()
     
-    if args.write:
-        benchmark_io('write', args.num_chunks, args.size_mb, args.concurrent)
-    if args.read:
-        benchmark_io('read', args.num_chunks, args.size_mb, args.concurrent)
-
-if __name__ == "__main__":
-    main()
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    asyncio.run(main(args))

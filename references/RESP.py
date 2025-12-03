@@ -33,124 +33,202 @@ import argparse
 class RedisClient: 
     def __init__(self, host, port, buffer_size): 
         self.sock = socket.create_connection((host, port))
+        
+        # OPTIMIZATION 1: Disable Nagle's algorithm for lower latency
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        
         self.buffer_size = buffer_size
         
-        # Pre-allocate a small buffer (e.g., 64 bytes) for header parsing
-        # RESP headers are small, so this should be sufficient.
-        self.header_buf = bytearray(64) 
+        # Internal buffer for reading headers/metadata to minimize syscalls
+        self._io_buf = bytearray(8192)
+        self._io_view = memoryview(self._io_buf)
+        self._io_pos = 0
+        self._io_end = 0
+
         self.OK_VIEW = memoryview(b"+OK\r\n")
 
-    # --- Low-Level I/O Helpers ---
+    # --- Buffered I/O Helpers ---
 
-    def _recv_into_exactly(self, buf: bytearray, size) -> int:
-        """Reads exactly 'size' bytes directly into the given bytearray."""
-        view = memoryview(buf)[:size]
-        total = 0
-        while total < size:
-            n = self.sock.recv_into(view[total:])
+    def _fill_buffer(self):
+        """Refills the internal IO buffer."""
+        # Reset pointers to maximize space
+        if self._io_pos == self._io_end:
+            self._io_pos = 0
+            self._io_end = 0
+        
+        # Only read if we have space
+        if self._io_end < len(self._io_buf):
+            n = self.sock.recv_into(self._io_view[self._io_end:])
             if n == 0:
-                raise ConnectionError("socket closed before all data received")
-            total += n
-        return total
-    
-    def _recv_exactly(self, size) -> memoryview: 
-        """Utility for reading fixed-size responses (e.g., +OK\r\n) into a new buffer."""
-        buf = bytearray(size)
-        self._recv_into_exactly(buf, size)
-        return memoryview(buf)
-    
-    def _read_header(self) -> bytes:
-        """
-        Optimized header read using recv_into.
-        Finds the end of the header (\r\n) by reading one byte at a time
-        into the pre-allocated header_buf, avoiding iterative concatenation copies.
-        Returns the header as a copy (since it's small metadata).
-        """
+                raise ConnectionError("Socket closed")
+            self._io_end += n
+
+    def _read_byte(self) -> int:
+        """Reads a single byte from the internal buffer, refilling if necessary."""
+        if self._io_pos >= self._io_end:
+            self._fill_buffer()
         
-        # NOTE: Header parsing must read until CRLF, which is a stream operation.
-        # This is the most complex part to make truly zero-copy.
+        b = self._io_buf[self._io_pos]
+        self._io_pos += 1
+        return b
+
+    def _read_line(self) -> bytes:
+        """
+        Reads until CRLF using the internal buffer. 
+        """
+        # FIX: Ensure we have data before setting line_start.
+        # If the buffer is empty, refill it and reset pointers to 0 
+        # BEFORE we decide where the line starts.
+        if self._io_pos >= self._io_end:
+            self._fill_buffer()
+
+        line_start = self._io_pos
         
-        view = memoryview(self.header_buf)
-        total = 0
         while True:
-            # Read one byte into the next slot in the header buffer
-            # This avoids the header = b"" + chunk copy from the original code
-            n = self.sock.recv_into(view[total:total + 1])
-            if n == 0:
-                raise ConnectionError("closed before header complete")
+            chunk = self._io_buf[self._io_pos:self._io_end]
             
-            # Check for \r\n terminator
-            if total >= 1 and self.header_buf[total-1] == 13 and self.header_buf[total] == 10: # 13=CR, 10=LF
-                return bytes(self.header_buf[:total+1]) # Small copy for metadata is acceptable
+            # Check for \r\n in the current chunk
+            if b'\r\n' in chunk:
+                idx = chunk.find(b'\r\n')
+                abs_idx = self._io_pos + idx
+                
+                result = self._io_buf[line_start:abs_idx + 2] # include \r\n
+                self._io_pos = abs_idx + 2
+                return bytes(result)
             
-            total += n
-            if total >= len(self.header_buf):
-                 raise ValueError("Header buffer too small for response header")
+            # Not found? We need more data.
+            if self._io_end == len(self._io_buf):
+                 # Buffer is full and we still haven't found a newline. 
+                 # This implies the header is larger than 8KB.
+                 raise ValueError("Header too large or malformed")
+            
+            # Read more data into the tail of the buffer
+            self._fill_buffer()
 
-    # --- Zero-Copy I/O Operations (Optimized) ---
+    def _send_all_via_sendmsg(self, parts: list[memoryview]):
+        """
+        OPTIMIZATION: Handles partial writes with sendmsg.
+        """
+        while parts:
+            n_sent = self.sock.sendmsg(parts)
+            if n_sent == 0:
+                raise ConnectionError("Socket connection broken")
+            
+            # If everything sent, break
+            # Calculating total length is expensive, so we adjust parts based on n_sent
+            
+            # Advance the views based on what was sent
+            curr_sent = 0
+            while parts and curr_sent < n_sent:
+                part = parts[0]
+                part_len = len(part)
+                rem_sent = n_sent - curr_sent
+                
+                if rem_sent >= part_len:
+                    # This part was fully sent
+                    parts.pop(0)
+                    curr_sent += part_len
+                else:
+                    # This part was partially sent, slice it and stop
+                    parts[0] = part[rem_sent:]
+                    break
 
     def get(self, key: str, recv_buf: bytearray) -> int:
         key_bytes = key.encode()
         
-        # 1. Prepare Command Buffers for sendmsg (Zero-Copy Send)
-        # We use memoryview() on the *small* parts to allow sendmsg to gather them.
-        # The key bytes are automatically gathered.
         command_parts = [
-            memoryview(b"*2\r\n"),                                   # Array header
-            memoryview(f"${len(b'GET')}\r\n".encode()),              # GET bulk length
-            memoryview(b"GET\r\n"),                                  # GET bulk data
-            memoryview(f"${len(key_bytes)}\r\n".encode()),           # Key bulk length
-            memoryview(key_bytes),                                   # Key bulk data
-            memoryview(b"\r\n")                                      # Final CRLF for key
+            memoryview(b"*2\r\n"),
+            memoryview(f"${len(b'GET')}\r\n".encode()),
+            memoryview(b"GET\r\n"),
+            memoryview(f"${len(key_bytes)}\r\n".encode()),
+            memoryview(key_bytes),
+            memoryview(b"\r\n")
         ]
         
-        # Use sendmsg for scatter-gather I/O. This avoids creating one large 'get_cmd' copy.
-        self.sock.sendmsg(command_parts)
+        self._send_all_via_sendmsg(command_parts)
         
-        # 2. Consume Header (Minimized Copy Receive)
-        header = self._read_header()
+        header = self._read_line() # e.g., b'$4194304\r\n' or b'$-1\r\n'
+
+        if header.startswith(b"$-1"):
+            return -1 # Key not found
 
         if not header.startswith(b"$"):
             raise ValueError(f"Unexpected reply: {header!r}")
         
-        # Header is like $12345\r\n. We strip the first ($) and the last two (\r\n)
         size = int(header[1:-2]) 
         
-        # Assertion to maintain POC structure
-        assert size == self.buffer_size, f"Expected {self.buffer_size} bytes, got {size}"
+        # Safety check for buffer size
+        if size > len(recv_buf):
+             raise ValueError(f"Value too large for buffer: {size} > {len(recv_buf)}")
 
-        # 3. Consume Body (Zero-Copy Receive)
-        n = self._recv_into_exactly(recv_buf, size)
+        # --- OPTIMIZATION: Zero-Copy Read handling internal buffer overlap ---
+        
+        bytes_read = 0
+        
+        # 1. Drain internal buffer first (Zero-copy logic)
+        # If the server sent [Header][Start of Body] in one packet, 
+        # it is sitting in self._io_buf
+        remaining_in_io = self._io_end - self._io_pos
+        
+        if remaining_in_io > 0:
+            to_copy = min(size, remaining_in_io)
+            recv_buf[0:to_copy] = self._io_buf[self._io_pos : self._io_pos + to_copy]
+            self._io_pos += to_copy
+            bytes_read += to_copy
+            
+        # 2. Read remainder directly into user buffer
+        if bytes_read < size:
+            view = memoryview(recv_buf)
+            while bytes_read < size:
+                needed = size - bytes_read
+                n = self.sock.recv_into(view[bytes_read:bytes_read+needed])
+                if n == 0:
+                    raise ConnectionError("Socket closed mid-body")
+                bytes_read += n
+        
+        # 3. Consume trailing CRLF
+        # We must be careful: the CRLF might be in the stream now, 
+        # or partially in our io_buf if we over-read (though recv_into above limits that).
+        # We simply use _read_line or _read_byte to eat 2 bytes.
+        # Since we did recv_into exactly `needed`, the socket pointer is at the CRLF.
+        
+        # We can't assume the internal buffer has the CRLF because we bypassed it 
+        # for the large read. We should just read 2 bytes safely.
+        
+        # To keep it simple/safe, we read 2 bytes. 
+        # Optimization note: Since we bypassed _io_buf for the body, _io_buf is effectively empty/invalid
+        # regarding the stream position unless we implement complex cursor logic.
+        # For this POC, we can just do a small read.
+        
+        self._io_pos = 0; self._io_end = 0 # Invalidate buffer after direct socket read
+        c1 = self.sock.recv(1)
+        c2 = self.sock.recv(1)
+        if c1 != b'\r' or c2 != b'\n':
+             raise ValueError("Missing final CRLF")
 
-        # 4. Consume trailing CRLF
-        self._recv_exactly(2)
-
-        return n
+        return bytes_read
 
     def set(self, key: str, send_buf: bytearray):
         key_bytes = key.encode()
         
-        # 1. Prepare Command Buffers for sendmsg (Zero-Copy Send)
-        # memoryview(send_buf) ensures the large data payload is not copied
         command_parts = [
-            memoryview(b"*3\r\n"),                                   # Array header
-            memoryview(f"${len(b'SET')}\r\n".encode()),              # SET bulk length
-            memoryview(b"SET\r\n"),                                  # SET bulk data
-            memoryview(f"${len(key_bytes)}\r\n".encode()),           # Key bulk length
-            memoryview(key_bytes),                                   # Key bulk data
-            memoryview(b"\r\n"),                                     # CRLF after key
-            memoryview(f"${len(send_buf)}\r\n".encode()),            # Value bulk length
-            memoryview(send_buf),                                    # Value data (The Zero-Copy Payload)
-            memoryview(b"\r\n")                                      # Final CRLF
+            memoryview(b"*3\r\n"),
+            memoryview(f"${len(b'SET')}\r\n".encode()),
+            memoryview(b"SET\r\n"),
+            memoryview(f"${len(key_bytes)}\r\n".encode()),
+            memoryview(key_bytes),
+            memoryview(b"\r\n"),
+            memoryview(f"${len(send_buf)}\r\n".encode()),
+            memoryview(send_buf),
+            memoryview(b"\r\n")
         ]
         
-        # Use sendmsg to send all parts without concatenating them in Python memory
-        self.sock.sendmsg(command_parts)
+        self._send_all_via_sendmsg(command_parts)
 
-        # 2. Expect +OK\r\n (Fixed-size Zero-Copy into temporary buffer)
-        reply = self._recv_exactly(5)
-        if reply != self.OK_VIEW:
-            raise ValueError(f"Unexpected reply: {reply!r}")
+        # Buffer response reading
+        reply = self._read_line()
+        if reply != b"+OK\r\n":
+             raise ValueError(f"Unexpected reply: {reply!r}")
 
 class BufferPool: 
     # default is 1024 buffers of 4 MB each
