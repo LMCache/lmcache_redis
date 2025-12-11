@@ -310,6 +310,8 @@ if __name__ == "__main__":
     parser.add_argument("--pool-size", type=int, default=1024)
     parser.add_argument("--buffer-size", type=int, default=4194304) # 4 MB
     parser.add_argument("--num-threads", type=int, required=False)
+    parser.add_argument("--host", type=str, default="localhost")
+    parser.add_argument("--port", type=int, default=6379)
     args = parser.parse_args()
     pool = BufferPool(pool_size=args.pool_size, buffer_size=args.buffer_size)
 
@@ -317,13 +319,13 @@ if __name__ == "__main__":
     # single threaded
     if args.num_threads is None:
         print("Running single threaded benchmark")
-        client = RedisClient(host="localhost", port=6379, buffer_size=args.buffer_size)
+        client = RedisClient(host=args.host, port=args.port, buffer_size=args.buffer_size)
         benchmark_write(client, pool)
         benchmark_read(client, pool)
 
     # multi threaded codepath
     else:
         print(f"Running multi threaded benchmark with {args.num_threads} threads")
-        client = MultiThreadedRedisClient(host="localhost", port=6379, buffer_size=args.buffer_size, num_threads=args.num_threads)
+        client = MultiThreadedRedisClient(host=args.host, port=args.port, buffer_size=args.buffer_size, num_threads=args.num_threads)
         benchmark_write_concurrent(client, pool)
         benchmark_read_concurrent(client, pool)    
