@@ -4,6 +4,7 @@ import time
 import queue
 import threading
 from concurrent.futures import Future
+from typing import List
 
 """
 error:
@@ -250,6 +251,34 @@ class RedisClient:
         else:
             raise ValueError("EXISTS command returned invalid response")
 
+    def _recv_int_response(self) -> int:
+        """
+        When we don't know beforehand the size of the response
+        """
+        tmp = bytearray()
+        while True:
+            # read one byte at a time
+            b = self.sock.recv(1)
+            if len(tmp) == 0:
+                assert b == b":"
+            if not b:
+                raise ConnectionError("Socket closed while reading")
+            tmp.append(b[0])
+            if len(tmp) >= 2 and tmp[-2:] == b"\r\n":
+                # exclude the prefix : and the CRLF
+                return int(tmp[1:-2])
+                
+    def batched_exists(self, keys: List[str]) -> List[bool]:
+        parts = [*self._exists_prefix] + [
+            item
+            for key in keys
+            for item in (self.make_key_header(key)[1], self.crlf, self.make_key_header(key)[0], self.crlf)
+        ]
+        self._send_multipart(parts)
+
+        return self._recv_int_response()
+        
+
 
 class MultiThreadedRedisClient:
     """
@@ -275,7 +304,7 @@ class MultiThreadedRedisClient:
         while True: 
             op, key, buf, future = q.get()
             try: 
-                # opcodes: get, set, exists
+                # opcodes: get, set, exists, batched_exists, close
                 if op == "get":
                     client.get(key, buf)
                     future.set_result(None)
@@ -286,6 +315,11 @@ class MultiThreadedRedisClient:
                 
                 elif op == "exists":
                     exists = client.exists(key)
+                    future.set_result(exists)
+                
+                elif op == "batched_exists":
+                    # key is a list of key strs here
+                    exists = client.batched_exists(key)
                     future.set_result(exists)
                 
                 elif op == "close":
@@ -321,6 +355,11 @@ class MultiThreadedRedisClient:
     def exists(self, key):
         f = Future()
         self._dispatch(("exists", key, None, f))
+        return f
+
+    def batched_exists(self, keys: List[str]) -> List[bool]:
+        f = Future()
+        self._dispatch(("batched_exists", keys, None, f))
         return f
 
     def close(self): 
@@ -388,7 +427,15 @@ def test_exists(client: RedisClient, pool: BufferPool):
     start_time = time.time()
     for i in range(pool.pool_size):
         exists = client.exists(f"chunk_{i}")
-        assert exists, f"chunk_{i} does not exist after write"
+        assert exists.result(), f"chunk_{i} does not exist after write"
+    end_time = time.time()
+    print(f"Tested {pool.pool_size} exists in {end_time - start_time} seconds")
+
+    start_time = time.time()
+    exists = client.batched_exists([f"chunk_{i}" for i in range(pool.pool_size)])
+    result = exists.result()
+    print(result)
+    assert result == pool.pool_size, "Some chunks do not exist after write"
     end_time = time.time()
     print(f"Tested {pool.pool_size} exists in {end_time - start_time} seconds")
 
