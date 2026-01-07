@@ -4,6 +4,26 @@ import time
 import queue
 import threading
 from concurrent.futures import Future
+
+"""
+error:
+
+(jiayis-dad) tensormesh@GPU-H100-lccn11:~/jiayis-dad/lmcache_redis$ python benchmark/RESP-py-bench-2.py --pool-size 4096
+Running single threaded benchmark
+Traceback (most recent call last):
+  File "/home/tensormesh/jiayis-dad/lmcache_redis/benchmark/RESP-py-bench-2.py", line 376, in <module>
+    benchmark_write(client, pool)
+  File "/home/tensormesh/jiayis-dad/lmcache_redis/benchmark/RESP-py-bench-2.py", line 318, in benchmark_write
+    client.set(f"chunk_{i}", buf)
+  File "/home/tensormesh/jiayis-dad/lmcache_redis/benchmark/RESP-py-bench-2.py", line 200, in set
+    self._send_multipart(parts)
+  File "/home/tensormesh/jiayis-dad/lmcache_redis/benchmark/RESP-py-bench-2.py", line 115, in _send_multipart
+    n_sent = self.sock.sendmsg(parts)
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+ConnectionResetError: [Errno 104] Connection reset by peer
+
+"""
+
 """
 Variance can be up to 1-2 GB/s
 
@@ -32,23 +52,40 @@ Read  16.00 GB in 2.767 s  →  5.783 GB/s
 # redis-cli -p 6379 FLUSHALL
 # redis-cli -p 6379 DBSIZE
 
-class RedisClient: 
-    """
-    Fully optimized deterministic-size RESP client.
 
-    Assumptions:
-      - Every SET stores exactly buffer_size bytes.
-      - Every GET returns exactly buffer_size bytes.
-      - Keys always exist (no $-1).
-      - RESP header is fixed-length: $<size>\r\n
+class RedisClient:
+    """
+    A client implementing RESP2 only for GET, SET, and EXISTS
+    Should be wrapped with MultiRESPClient
+
+    Primary Assumption (for "chunked" parsing and reusing payloads): 
+    The size of payloads (KV cache object) is always fixed. The retrieval
+    helper `_recv_exactly(n, buf)` can be used to retrieve payloads without
+    having to scan for \r\n
+    
+
+    Optimizations: 
+    - zero copy retrieval (through recv_into) ** not supported by redis-py **
+    - scatter-gather sending (through sendmsg)
     """
     def __init__(self, host: str, port: int, buffer_size: int):
-        self.buffer_size = buffer_size
+        """
+        the chunk_size must be known beforehand (save_unfull_chunk = False)
+        for this client to work
+        """
+        self.chunk_size = buffer_size
+        self._generate_reusables(buffer_size)
+        self.sock = socket.create_connection((host, port))
 
-        # Pre-compute the deterministic RESP bulk header
-        self.header = f"${buffer_size}\r\n".encode()
-        self.header_len = len(self.header)
-        self.trailer_len = 2  # b"\r\n"
+
+    def _generate_reusables(self, chunk_size: int):
+        # some cached objects for scatter-gather sending
+        # and response parsing
+        self.size_header = f"${chunk_size}\r\n".encode()
+        self.size_header_len = len(self.size_header)
+
+        self.crlf = memoryview(b"\r\n")
+        self.crlf_len = len(self.crlf)
 
         self._get_prefix = [
             memoryview(b"*2\r\n"),
@@ -60,42 +97,42 @@ class RedisClient:
             memoryview(b"$3\r\nSET\r\n"),
         ]
 
+        self._exists_prefix = [
+            memoryview(b"*2\r\n"),
+            memoryview(b"$6\r\nEXISTS\r\n"),
+        ]
+
+        # simple string response for set
         self._ok = memoryview(b"+OK\r\n")
+        self._ok_len = len(self._ok)
 
-        # Create and configure socket
-        self.sock = socket.create_connection((host, port))
-        
-        # nagle's algo disabled does NOT help since we want to batch more for raw throughput
-        # self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # integer response for exists
+        self._one = memoryview(b":1\r\n")
+        self._zero = memoryview(b":0\r\n")
+        # assumes int < 256
+        self._int_len = len(self._one) # len(self._zero)
 
-        # could look into the opposite config of TCP_NODELAY: TCP_CORK
-        # self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 1)
+    # --- recv and send (optimized for zero copy) ---
 
-    def _recv_exactly(self, n: int, into: memoryview | None = None):
+    def _recv_exactly_into(self, n: int, into: memoryview):
         """
         Reads exactly n bytes.
-        If 'into' is provided, fills that buffer; else returns a new buffer.
         """
-        if into is not None:
-            view = into
-        else:
-            buf = bytearray(n)
-            view = memoryview(buf)
-
+        assert into is not None
         total = 0
         while total < n:
-            m = self.sock.recv_into(view[total:total + (n - total)])
+            m = self.sock.recv_into(into[total:total + (n - total)])
             if m == 0:
                 raise ConnectionError("Socket closed during recv_exactly")
             total += m
 
-        return view if into is None else None
-
-    def _send_all_via_sendmsg(self, parts: list[memoryview]):
+    def _send_multipart(self, parts: list[memoryview]):
         """
         Zero-copy scatter/gather write with correct partial-write handling.
         """
+        # parts will be "consumed" (popped) as they are sent
         while parts:
+            # bytes sent
             n_sent = self.sock.sendmsg(parts)
             if n_sent == 0:
                 raise ConnectionError("Broken connection during sendmsg")
@@ -113,122 +150,164 @@ class RedisClient:
                     parts[0] = p[remain:]
                     break
 
-    def get(self, key: str, recv_buf: memoryview) -> int:
-        """
-        Retrieves exactly buffer_size bytes into recv_buf.
-        Uses deterministic header length (no parsing).
-        """
+    # only support 3 commands
+    # GET
+    # SET
+    # EXISTS
 
+    def make_key_header(self, key: str) -> tuple[memoryview, memoryview]:
         key_b = key.encode()
         key_len_hdr = f"${len(key_b)}\r\n".encode()
+        return memoryview(key_b), memoryview(key_len_hdr)
 
-        # Build scatter-gather message
+    def get(self, key: str, recv_buf: memoryview):
+        """
+        assumption:
+        both recv_buf and the payload stored in redis for key 
+        should be of size chunk_size
+
+        recv_buf should be a direct reference to the buffer inside
+        of a MemoryObj for zero-copy retrieval
+        """ 
+        assert len(recv_buf) == self.chunk_size, "recv_buf is not of size chunk_size"
+
+        key_b, key_len_hdr = self.make_key_header(key)
+
+        # build scatter gather msg
         parts = [
             *self._get_prefix,
-            memoryview(key_len_hdr),
-            memoryview(key_b),
-            memoryview(b"\r\n"),
+            key_len_hdr,
+            key_b,
+            self.crlf,
         ]
 
-        # Send GET command
-        self._send_all_via_sendmsg(parts)
+        self._send_multipart(parts)
 
-        # 1. Read deterministic header: $<buffer_size>\r\n
-        tmp_header = bytearray(self.header_len)
-        self._recv_exactly(self.header_len, memoryview(tmp_header))
+        # 1. read size header (validation)
+        # we could discard the header but validating it is safer
+        size_hdr = bytearray(self.size_header_len)
+        self._recv_exactly_into(self.size_header_len, memoryview(size_hdr))
 
-        if tmp_header != self.header:
-            raise ValueError(f"Unexpected GET header: {tmp_header!r}")
+        assert size_hdr == self.size_header, "GET command returned invalid size header"
 
-        # 2. Read VALUE directly into caller buffer (zero-copy)
-        if len(recv_buf) < self.buffer_size:
-            raise ValueError("recv_buf too small")
+        # 2. read the payload / KV Cache directly into the recv_buf
+        self._recv_exactly_into(self.chunk_size, recv_buf)
 
-        self._recv_exactly(self.buffer_size, recv_buf)
+        # 3. read the trailer (validation)
+        # we could discard the trailer but validating it is safer
+        trailer = bytearray(self.crlf_len)
+        self._recv_exactly_into(self.crlf_len, memoryview(trailer))
+        assert trailer == self.crlf, "GET command returned invalid trailer"
 
-        # 3. Read trailing CRLF
-        tmp = bytearray(2)
-        self._recv_exactly(2, memoryview(tmp))
-
-        if tmp != b"\r\n":
-            raise ValueError("Missing final CRLF after GET body")
-
-        return self.buffer_size
-
-    def set(self, key: str, send_buf: memoryview):
+    def set(self, key: str, send_buf: memoryview): 
         """
-        Sends exactly buffer_size bytes as the value.
+        assumption: send_buf is of size chunk_size
         """
+        assert len(send_buf) == self.chunk_size, "send_buf is not of size chunk_size"
 
-        if len(send_buf) != self.buffer_size:
-            raise ValueError("send_buf must be exactly buffer_size bytes.")
+        key_b, key_len_hdr = self.make_key_header(key)
 
-        key_b = key.encode()
-        key_len_hdr = f"${len(key_b)}\r\n".encode()
-
+        # build scatter gather msg
         parts = [
             *self._set_prefix,
-            memoryview(key_len_hdr),
-            memoryview(key_b),
-            memoryview(b"\r\n"),
-            memoryview(self.header),   # $<buffer_size>\r\n
-            send_buf,          # actual payload (zero-copy)
-            memoryview(b"\r\n")
+            key_len_hdr,
+            key_b,
+            self.crlf,
+            self.size_header,
+            send_buf,
+            self.crlf,
         ]
 
-        self._send_all_via_sendmsg(parts)
+        self._send_multipart(parts)
 
-        # Expect "+OK\r\n"
-        tmp = bytearray(5)
-        self._recv_exactly(5, memoryview(tmp))
+        # expect the ok response
+        ret = bytearray(self._ok_len)
+        self._recv_exactly_into(self._ok_len, memoryview(ret))
+        assert ret == self._ok, "SET command returned invalid response"
+    
+    def exists(self, key: str) -> bool: 
+        """
+        check key existence
+        """
+        key_b, key_len_hdr = self.make_key_header(key)
 
-        if tmp != b"+OK\r\n":
-            raise ValueError(f"Unexpected SET reply: {tmp!r}")
+        parts = [
+            *self._exists_prefix,
+            key_len_hdr,
+            key_b,
+            self.crlf,
+        ]
+
+        self._send_multipart(parts)
+
+        # read the response
+        ret = bytearray(self._int_len)
+        self._recv_exactly_into(self._int_len, memoryview(ret))
+        if ret == self._one:
+            return True
+        elif ret == self._zero:
+            return False
+        else:
+            raise ValueError("EXISTS command returned invalid response")
+
 
 class MultiThreadedRedisClient:
-    def __init__(self, host, port, buffer_size, num_threads):
+    """
+    Multithreaded wrapper around RedisClient
+
+    Please pass in keys with string serialization
+    """
+    def __init__(self, host: str, port: int, buffer_size: int, num_threads: int): 
         self.num_threads = num_threads
-        self.next = 0  # round-robin index
+        self.i = 0 # round robin index for the dispatcher
 
-        # One queue per thread
         self.queues = [queue.Queue() for _ in range(num_threads)]
+        self.clients = [RedisClient(host, port, buffer_size) for _ in range(num_threads)]
 
-        # One RedisClient per thread
-        self.clients = [
-            RedisClient(host, port, buffer_size) for _ in range(num_threads)
+        self.threads = [
+            threading.Thread(target=self.worker_loop, args=(self.clients[i], self.queues[i]), daemon=True)
+            for i in range(num_threads)
         ]
+        for thread in self.threads:
+            thread.start()
 
-        # Start worker threads
-        self.threads = []
-        for i in range(num_threads):
-            t = threading.Thread(target=self._worker_loop, args=(i,), daemon=True)
-            t.start()
-            self.threads.append(t)
-
-    def _worker_loop(self, idx):
-        client = self.clients[idx]
-        q = self.queues[idx]
-
-        while True:
+    def worker_loop(self, client: RedisClient, q: queue.Queue):
+        while True: 
             op, key, buf, future = q.get()
-
-            try:
-                if op == "set":
+            try: 
+                # opcodes: get, set, exists
+                if op == "get":
+                    client.get(key, buf)
+                    future.set_result(None)
+                
+                elif op == "set":
                     client.set(key, buf)
-                    if future:
-                        future.set_result(None)
-                else:  # GET
-                    n = client.get(key, buf)
-                    future.set_result(n)
+                    future.set_result(None)
+                
+                elif op == "exists":
+                    exists = client.exists(key)
+                    future.set_result(exists)
+                
+                elif op == "close":
+                    client.close()
+                
+                else:
+                    raise ValueError(f"Invalid operation: {op}")
             except Exception as e:
                 if future:
                     future.set_exception(e)
-
-    def _dispatch(self, item):
-        i = self.next
-        self.next = (self.next + 1) % self.num_threads
+            finally:
+                q.task_done()
+        
+    def _dispatch(self, item): 
+        """
+        Dispatch a job to a worker RESPClient
+        """
+        # item: (op, key, buf, future)
+        i = self.i
+        self.i = (i + 1) % self.num_threads
         self.queues[i].put(item)
-
+    
     def set(self, key, buf):
         f = Future()
         self._dispatch(("set", key, buf, f))
@@ -238,6 +317,17 @@ class MultiThreadedRedisClient:
         f = Future()
         self._dispatch(("get", key, buf, f))
         return f
+
+    def exists(self, key):
+        f = Future()
+        self._dispatch(("exists", key, None, f))
+        return f
+
+    def close(self): 
+        for i in range(self.num_threads):
+            self._dispatch(("close", None, None, None))
+        for thread in self.threads:
+            thread.join()
 
 class BufferPool: 
     # may need thread-safety
@@ -291,6 +381,18 @@ def benchmark_read(client: RedisClient, pool: BufferPool):
     end_time = time.time()
     print(f"Read {pool.total_size / 1024 ** 3} GB in {end_time - start_time} seconds, which is: {pool.total_size / (end_time - start_time) / 1024 ** 3} GB/s")
 
+def test_exists(client: RedisClient, pool: BufferPool):
+    """
+    Should be called AFTER benchmark_write
+    """
+    start_time = time.time()
+    for i in range(pool.pool_size):
+        exists = client.exists(f"chunk_{i}")
+        assert exists, f"chunk_{i} does not exist after write"
+    end_time = time.time()
+    print(f"Tested {pool.pool_size} exists in {end_time - start_time} seconds")
+
+
 def benchmark_read_concurrent(client: MultiThreadedRedisClient, pool: BufferPool):
     start_time = time.time()
     futures = []
@@ -319,6 +421,7 @@ if __name__ == "__main__":
         print("Running single threaded benchmark")
         client = RedisClient(host="localhost", port=6379, buffer_size=args.buffer_size)
         benchmark_write(client, pool)
+        test_exists(client, pool)
         benchmark_read(client, pool)
 
     # multi threaded codepath
@@ -326,4 +429,5 @@ if __name__ == "__main__":
         print(f"Running multi threaded benchmark with {args.num_threads} threads")
         client = MultiThreadedRedisClient(host="localhost", port=6379, buffer_size=args.buffer_size, num_threads=args.num_threads)
         benchmark_write_concurrent(client, pool)
+        test_exists(client, pool)
         benchmark_read_concurrent(client, pool)    
